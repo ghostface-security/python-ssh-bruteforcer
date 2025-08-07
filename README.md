@@ -78,7 +78,7 @@ Installation
 
 To use this script, simply clone the repository:
 
-git clone https://github.com/ghostface-security/python-ssh-bruteforcer.git && cd python-ssh-bruteforcer/
+git clone https://github.com/ghostface-security/python-ssh-bruteforcer.git && cd python-ssh-bruteforcer
 
 This script requires the pexpect library. You can install it using pip:
 
